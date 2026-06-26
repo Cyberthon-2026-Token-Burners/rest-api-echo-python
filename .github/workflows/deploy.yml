@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: Deploy to GCP Cloud Run
 
 on:
   push:
@@ -8,60 +8,73 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  PYTHONPATH: /workspace/.sdlc_deps
-
-permissions:
-  id-token: write
-  contents: write
 
 jobs:
-  test-and-lint:
+  ci:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Create Workspace Directory
-        run: sudo mkdir -p /workspace && sudo chmod 777 /workspace
+      - name: Prepare workspace directory
+        run: |
+          sudo mkdir -p /workspace
+          sudo chown -R $USER /workspace
 
-      - name: Install dependencies
+      - name: Setup dependencies
         run: pip install --target=/workspace/.sdlc_deps -r requirements.txt 2>/dev/null || true
 
-      - name: Build / Compile
+      - name: Build
         run: python -m compileall -q -x '(^|/)\.sdlc_deps(/|$)' .
+        env:
+          PYTHONPATH: /workspace/.sdlc_deps
 
-      - name: Run tests
-        run: python -m pytest
+      - name: Install Lint Tooling
+        run: pip install ruff
 
       - name: Lint
         run: ruff check --no-cache --extend-exclude=.sdlc_deps . && ruff format --check --exclude=.sdlc_deps .
+        env:
+          PYTHONPATH: /workspace/.sdlc_deps
+
+      - name: Test
+        run: python -m pytest
+        env:
+          PYTHONPATH: /workspace/.sdlc_deps
 
   deploy:
-    needs: test-and-lint
+    needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Google Auth via WIF
+      - name: Google Auth
         id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
-      - name: Configure Docker Auth
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
         run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
-      - name: Build and Push Container
+      - name: Build and Push Container Image
         run: |
-          docker build -t "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}" .
-          docker push "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}"
+          IMAGE_TAG="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}"
+          docker build -t "$IMAGE_TAG" .
+          docker push "$IMAGE_TAG"
 
       - name: Deploy to Cloud Run
         id: deploy
@@ -81,7 +94,7 @@ jobs:
 
       - name: Extract Cloud Run URLs
         id: urls
-        env:
+        env: 
           SERVICE: ${{ github.event.repository.name }}
           REGION: ${{ vars.GCP_REGION }}
           PROJECT: ${{ vars.GCP_PROJECT_ID }}
