@@ -4,34 +4,26 @@
 # Architecture State - Living ADR
 
 ## Active Components
-- **`app/config.py` (`Settings`, `get_settings`)**: Parses, validates, and serves application-wide configuration parameters from system environment variables. It enforces strict integer types on `PORT` and `MAX_PAYLOAD_SIZE` and prevents runtime startup if negative or non-integer configurations are provided.
-- **`app/main.py` (`app`)**: The main FastAPI microservice definition. It orchestrates routing, registers lifecycle handlers via ASGI lifespans to track boot time, and implements safe echo operations and basic endpoint diagnostics.
+- **`app/config.py` (`Settings`, `get_settings`)**: Parses, validates, and serves application-wide configuration parameters from environment variables (e.g. `PORT` and `MAX_PAYLOAD_SIZE`). It enforces strict integer types and guards against negative or invalid bounds.
+- **`app/main.py` (`app`)**: The main FastAPI microservice definition. It orchestrates routing, manages the ASGI lifespan configuration to record start time, parses incoming query string items, streams requests chunk-by-chunk for memory safety, and performs early header-based validation.
 
 ## Public Interfaces & Signatures
+
 ### Configuration Management (`app/config.py`)
-- **`Settings`**:
-  ```python
-  def __init__(self, port: int = 8080, max_payload_size: int = 5242880, start_time: float = 0.0)
-  ```
-- **`get_settings`**:
-  ```python
-  def get_settings() -> Settings
-  ```
+- `Settings`: Holder for configured `port` (default `8080`), `max_payload_size` (default `5242880` bytes), and runtime `start_time` float epoch.
+- `get_settings() -> Settings`: Loaded-once configuration builder parsing environment configurations.
 
 ### Application Endpoints (`app/main.py`)
-- **`lifespan`**:
-  ```python
-  async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]
-  ```
-- **`GET /health`** (`health_check`): Returns a JSON payload showing service status and computed uptime from initialization.
-- **`POST /echo`** (`echo_handler`): Receives request payloads, inspects size bounds, and mirrors headers, parameters, and decoded payload bytes to the client.
+- `lifespan(app: FastAPI) -> AsyncGenerator[None, None]`: Captures start time epoch onto `app.state.settings.start_time` upon ASGI app bootstrap.
+- `GET /health` (`health_check`): Computes process uptime relative to the recorded start time and returns status telemetry.
+- `GET, POST, PUT, PATCH, DELETE /echo` (`echo_handler`): Performs stateless reflection of method, headers, parsed query variables, and request body.
 
 ## Design Patterns
-- **ASGI Lifespan Management**: Eliminates mutable global configuration variables by attaching runtime dynamic settings (`Settings` containing boot timestamp) directly onto the FastAPI `app.state`.
-- **Zero-Dependency Bootstrapping (Fallback Pattern)**: When no variables are supplied in the production environment, the server dynamically falls back to standard container conventions (`PORT=8080`, payload limit of 5MB).
-- **Strict Configuration Validator**: Integrates defensive type parsing checks to prevent silent coercion (such as interpreting boolean keywords as integer defaults).
+- **Early-Abort Streaming Middleware Pattern**: Instead of buffering request bodies blindly in RAM, the handler streams raw chunks. The moment total received bytes exceed `MAX_PAYLOAD_SIZE`, it aborts and returns an HTTP 413. This avoids memory exhaustion vectors (OOM/DoS).
+- **Header Validation Guard**: Validates both `Content-Length` and `X-Echo-Status` headers before committing to stream reading, ensuring erroneous or malicious metadata fails fast with HTTP 400.
+- **Explicit Query Parameter Mapping**: Avoids standard framework lax multi-value mappings. Maps unique keys to a string value, duplicate keys to an array of strings, and empty definitions to empty strings explicitly.
 
 ## Non-Functional Invariants
-- **Startup Latency Constraint**: Process startup, settings loading, and port routing mapping must complete in under 1.0 second.
-- **Payload Memory Safety**: To protect against Denial-of-Service attacks, requests containing payloads over `MAX_PAYLOAD_SIZE` are immediately rejected with an HTTP `413 Payload Too Large` error.
-- **Stateless Operation**: No database connection or file logging backend is registered, facilitating fast horizontal scaling on ephemeral container runners.
+- **Execution Latency Constraint**: Processing overhead under 2.0 ms p99 (excluding network transit latency) for any request cycle.
+- **Startup Latency**: Server bootstrap, initialization, and port binding completed in under 1.0 second.
+- **Strict Statelessness**: Zero file-system logging, zero local storage, zero database dependencies, ensuring clean container horizontal scaling.
