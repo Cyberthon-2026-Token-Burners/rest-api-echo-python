@@ -1,31 +1,15 @@
 FROM python:3.12-slim AS builder
-
-WORKDIR /workspace
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-FROM python:3.12-slim AS runner
-
+FROM python:3.12-slim
 WORKDIR /app
-
 COPY --from=builder /install /usr/local
-
-RUN groupadd -g 1000 appgroup && \
-    useradd -r -u 1000 -g appgroup -m -s /sbin/nologin appuser
-
-COPY app/ /app/app/
-RUN chown -R appuser:appgroup /app
-
+COPY app/ ./app/
+RUN groupadd -g 10001 appuser && useradd -u 10001 -g appuser -s /bin/bash -m appuser && chown -R appuser:appuser /app
 USER appuser
-
 EXPOSE 8080
-
 ENV PORT=8080
-ENV PYTHONUNBUFFERED=1
-
 CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: Deploy to GCP Cloud Run
 
 on:
   push:
@@ -6,114 +6,123 @@ on:
       - main
       - master
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  PYTHONPATH: /workspace/.sdlc_deps
-
 permissions:
   id-token: write
   contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test-and-lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Create Workspace Directory
+      - name: Create workspace directory
         run: sudo mkdir -p /workspace && sudo chmod 777 /workspace
 
-      - name: Install dependencies
+      - name: Run Setup Command
         run: pip install --target=/workspace/.sdlc_deps -r requirements.txt 2>/dev/null || true
 
-      - name: Build / Compile
+      - name: Run Build Command
         run: python -m compileall -q -x '(^|/)\.sdlc_deps(/|$)' .
 
-      - name: Run tests
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$PYTHONPATH:/workspace/.sdlc_deps" >> "$GITHUB_ENV"
+
+      - name: Run Test Command
         run: python -m pytest
 
-      - name: Lint
+      - name: Run CI Lint Setup Command
+        run: pip install ruff
+
+      - name: Run Lint Command
         run: ruff check --no-cache --extend-exclude=.sdlc_deps . && ruff format --check --exclude=.sdlc_deps .
 
   deploy:
     needs: test-and-lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Google Auth via WIF
+      - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
       - name: Configure Docker Auth
         run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
-      - name: Build and Push Container
+      - name: Build and Push Docker Image
         run: |
-          docker build -t "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}" .
-          docker push "${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}"
+          IMAGE_TAG="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}"
+          docker build -t "$IMAGE_TAG" .
+          docker push "$IMAGE_TAG"
 
-      - name: Deploy to Cloud Run
-        id: deploy
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: ${{ github.event.repository.name }}
-          region: ${{ vars.GCP_REGION }}
-          image: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}
-          flags: '--allow-unauthenticated'
+          - name: Deploy to Cloud Run
+            id: deploy
+            uses: google-github-actions/deploy-cloudrun@v2
+            with:
+              service: ${{ github.event.repository.name }}
+              image: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GCP_REGISTRY_NAME }}/${{ github.event.repository.name }}:${{ github.sha }}
+              region: ${{ vars.GCP_REGION }}
+              flags: '--allow-unauthenticated'
 
-      - name: Allow public (unauthenticated) invocation
-        env:
-          SERVICE: ${{ github.event.repository.name }}
-          REGION: ${{ vars.GCP_REGION }}
-          PROJECT: ${{ vars.GCP_PROJECT_ID }}
-        run: gcloud run services add-iam-policy-binding "$SERVICE" --region="$REGION" --project="$PROJECT" --member="allUsers" --role="roles/run.invoker"
+          - name: Allow public (unauthenticated) invocation
+            env:
+              SERVICE: ${{ github.event.repository.name }}
+              REGION: ${{ vars.GCP_REGION }}
+              PROJECT: ${{ vars.GCP_PROJECT_ID }}
+            run: gcloud run services add-iam-policy-binding "$SERVICE" --region="$REGION" --project="$PROJECT" --member="allUsers" --role="roles/run.invoker"
 
-      - name: Extract Cloud Run URLs
-        id: urls
-        env:
-          SERVICE: ${{ github.event.repository.name }}
-          REGION: ${{ vars.GCP_REGION }}
-          PROJECT: ${{ vars.GCP_PROJECT_ID }}
-        run: |
-          SVC_JSON=$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$PROJECT" --format=json)
-          URL_STABLE=$(echo "$SVC_JSON" | jq -r '.status.url')
-          URL_REVISION="${{ steps.deploy.outputs.url }}"
-          if [ "$URL_STABLE" = "$URL_REVISION" ] || [ -z "$URL_REVISION" ]; then
-            URL_REVISION=$(echo "$SVC_JSON" | jq -r \
-              --arg stable "$URL_STABLE" \
-              '(.metadata.annotations["run.googleapis.com/urls"] // "[]") | fromjson | .[] | select(. != $stable)' \
-              2>/dev/null | head -n1)
-            URL_REVISION="${URL_REVISION:-$URL_STABLE}"
-          fi
-          echo "URL_STABLE=$URL_STABLE" >> "$GITHUB_ENV"
-          echo "URL_REVISION=$URL_REVISION" >> "$GITHUB_ENV"
+          - name: Extract Cloud Run URLs
+            id: urls
+            env:
+              SERVICE: ${{ github.event.repository.name }}
+              REGION: ${{ vars.GCP_REGION }}
+              PROJECT: ${{ vars.GCP_PROJECT_ID }}
+            run: |
+              SVC_JSON=$(gcloud run services describe "$SERVICE" --region="$REGION" --project="$PROJECT" --format=json)
+              URL_STABLE=$(echo "$SVC_JSON" | jq -r '.status.url')
+              URL_REVISION="${{ steps.deploy.outputs.url }}"
+              if [ "$URL_STABLE" = "$URL_REVISION" ] || [ -z "$URL_REVISION" ]; then
+                URL_REVISION=$(echo "$SVC_JSON" | jq -r \
+                  --arg stable "$URL_STABLE" \
+                  '(.metadata.annotations["run.googleapis.com/urls"] // "[]") | fromjson | .[] | select(. != $stable)' \
+                  2>/dev/null | head -n1)
+                URL_REVISION="${URL_REVISION:-$URL_STABLE}"
+              fi
+              echo "URL_STABLE=$URL_STABLE" >> "$GITHUB_ENV"
+              echo "URL_REVISION=$URL_REVISION" >> "$GITHUB_ENV"
 
-      - name: Update README with deployment URLs
-        run: |
-          perl -i -0pe \
-            "s|<!-- DEPLOYMENT_URL_START -->.*?<!-- DEPLOYMENT_URL_END -->|<!-- DEPLOYMENT_URL_START -->\n**Stable (corporate-proxy-safe):** [$URL_STABLE]($URL_STABLE)\n**Revision:** [$URL_REVISION]($URL_REVISION)\n<!-- DEPLOYMENT_URL_END -->|s" \
-            README.md || true
-          if ! grep -q "DEPLOYMENT_URL_START" README.md; then
-            printf '\n## 🚀 Live Deployment\n<!-- DEPLOYMENT_URL_START -->\n**Stable (corporate-proxy-safe):** [%s](%s)\n**Revision:** [%s](%s)\n<!-- DEPLOYMENT_URL_END -->\n' \
-              "$URL_STABLE" "$URL_STABLE" "$URL_REVISION" "$URL_REVISION" >> README.md
-          fi
-          if git diff --quiet README.md; then
-            echo "README deployment URLs already current; nothing to do."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md
-          git commit -m "docs: update live deployment URLs [skip ci]"
-          git push origin HEAD:"${{ github.event.repository.default_branch }}"
+          - name: Update README with deployment URLs
+            run: |
+              perl -i -0pe \
+                "s|<!-- DEPLOYMENT_URL_START -->.*?<!-- DEPLOYMENT_URL_END -->|<!-- DEPLOYMENT_URL_START -->\n**Stable (corporate-proxy-safe):** [\$URL_STABLE](\$URL_STABLE)\n**Revision:** [\$URL_REVISION](\$URL_REVISION)\n<!-- DEPLOYMENT_URL_END -->|s" \
+                README.md || true
+              if ! grep -q "DEPLOYMENT_URL_START" README.md; then
+                printf '\n## 🚀 Live Deployment\n<!-- DEPLOYMENT_URL_START -->\n**Stable (corporate-proxy-safe):** [%s](%s)\n**Revision:** [%s](%s)\n<!-- DEPLOYMENT_URL_END -->\n' \
+                  "$URL_STABLE" "$URL_STABLE" "$URL_REVISION" "$URL_REVISION" >> README.md
+              fi
+              if git diff --quiet README.md; then
+                echo "README deployment URLs already current; nothing to do."
+                exit 0
+              fi
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add README.md
+              git commit -m "docs: update live deployment URLs [skip ci]"
+              git push origin HEAD:"${{ github.event.repository.default_branch }}"
